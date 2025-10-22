@@ -1,0 +1,512 @@
+项目 'rawbot-2api' 的结构树:
+📂 rawbot-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 rawbot_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# rawbot-2api 配置文件模板 (v1.2 - OpenAI 移除版)
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的凭证。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8090
+
+# --- 下游服务凭证 (必须设置) ---
+# 从原始网络请求中提取的 Bearer Tokens
+COHERE_TOKEN="5vwtfzo14cl7SDqDb1s5PB8gPhlYgNTRPiqR94q0"
+AI21_TOKEN="Hlk4epA2ZO5MNj8p38FjnnkzZ6OGwZDH"
+MISTRAL_TOKEN="4hAD3tANyfX6KGAo3WbjvzjVonABcZrb"
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# rawbot-2api 配置文件模板 (v1.2 - OpenAI 移除版)
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的凭证。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-rawbot-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8090
+
+# --- 下游服务凭证 (必须设置) ---
+# 从原始网络请求中提取的 Bearer Tokens
+COHERE_TOKEN="5vwtfzo14cl7SDqDb1s5PB8gPhlYgNTRPiqR94q0"
+AI21_TOKEN="Hlk4epA2ZO5MNj8p38FjnnkzZ6OGwZDH"
+MISTRAL_TOKEN="4hAD3tANyfX6KGAo3WbjvzjVonABcZrb"
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for rawbot-2api (v1.0 - Concurrent Fan-Out Edition)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: rawbot-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8090}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - rawbot-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rawbot-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - rawbot-net
+
+networks:
+  rawbot-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import json
+from contextlib import asynccontextmanager
+from typing import Optional, Union
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.rawbot_provider import RawbotProvider
+
+# 日志配置保持不变
+logger.add(
+    "logs/app.log", 
+    rotation="10 MB", 
+    retention="7 days", 
+    level="INFO",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+    encoding="utf-8"
+)
+logger.add(
+    lambda msg: print(msg, end=''),
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}:{function}:{line}</cyan> - <level>{message}</level>",
+    colorize=True
+)
+
+provider = RawbotProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info("服务已进入 'Dual-Mode Smart Response' 模式。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- [核心修正] ---
+# 添加 response_model=None 来解决 FastAPI 启动错误
+@app.post(
+    "/v1/chat/completions",
+    dependencies=[Depends(verify_api_key)],
+    response_model=None 
+)
+async def chat_completions(request: Request) -> Union[JSONResponse, StreamingResponse]:
+    try:
+        request_data = await request.json()
+        
+        response = await provider.chat_completion(request_data)
+        
+        if isinstance(response, JSONResponse):
+             # 确保 response.body 是字节串
+             body_bytes = response.body
+             logger.info(f"--- [发送非流式响应] ---\n{json.dumps(json.loads(body_bytes.decode('utf-8')), indent=2, ensure_ascii=False)}")
+
+        return response
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    # provider.get_models() 已经返回 JSONResponse，直接返回即可
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream rawbot_backend {
+        # ip_hash is not strictly necessary here as the app is stateless,
+        # but it's good practice for potential future stateful features.
+        ip_hash;
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://rawbot_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # Standard proxy settings
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+httpx
+loguru
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "rawbot-2api"
+    APP_VERSION: str = "1.2.0"
+    DESCRIPTION: str = "一个将 rawbot.org 的多模型比较功能聚合为单一 API 的高性能代理 (已移除 OpenAI)。"
+
+    # --- 安全与部署 ---
+    API_MASTER_KEY: Optional[str] = None
+    NGINX_PORT: int = 8090
+
+    # --- 下游凭证 ---
+    COHERE_TOKEN: Optional[str] = None
+    AI21_TOKEN: Optional[str] = None
+    MISTRAL_TOKEN: Optional[str] = None
+
+    # --- API 行为 ---
+    API_REQUEST_TIMEOUT: int = 120
+
+    # --- 模型定义 ---
+    VIRTUAL_MODEL: str = "rawbot-omnibus"
+    KNOWN_MODELS: List[str] = [
+        "rawbot-omnibus",
+        "command-r-08-2024",
+        "jamba-mini",
+        "mistral-small-latest"
+    ]
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(self, request_data: Dict[str, Any]) -> JSONResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\rawbot_provider.py ---
+
+import httpx
+import asyncio
+import time
+import uuid
+from typing import Dict, Any, List, AsyncGenerator
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import HTTPException
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import create_chat_completion_chunk, create_sse_data, DONE_CHUNK
+
+class RawbotProvider(BaseProvider):
+    def __init__(self):
+        self.client = httpx.AsyncClient(timeout=settings.API_REQUEST_TIMEOUT)
+        self.providers = [
+            {"name": "Cohere", "model": "command-r-08-2024", "token": settings.COHERE_TOKEN, "url": "https://api.cohere.ai/v1/chat", "method": self._call_cohere},
+            {"name": "AI21 Labs", "model": "jamba-mini", "token": settings.AI21_TOKEN, "url": "https://api.ai21.com/studio/v1/chat/completions", "method": self._call_ai21},
+            {"name": "Mistral", "model": "mistral-small-latest", "token": settings.MISTRAL_TOKEN, "url": "https://api.mistral.ai/v1/chat/completions", "method": self._call_mistral},
+        ]
+
+    async def chat_completion(self, request_data: Dict[str, Any]):
+        user_prompt = next((m['content'] for m in reversed(request_data.get("messages", [])) if m.get('role') == 'user'), None)
+        if not user_prompt:
+            raise HTTPException(status_code=400, detail="在 'messages' 中未找到用户消息。")
+
+        # 根据客户端请求决定响应模式
+        if request_data.get("stream", False):
+            logger.info("检测到流式请求 (stream: true)，启动伪流式生成器。")
+            return StreamingResponse(self._stream_response_generator(user_prompt), media_type="text/event-stream")
+        else:
+            logger.info("处理非流式请求 (stream: false)。")
+            content = await self._get_aggregated_content(user_prompt)
+            response_data = self._build_non_stream_response(content)
+            return JSONResponse(content=response_data)
+
+    async def _get_aggregated_content(self, prompt: str) -> str:
+        """在内部并发获取所有结果并格式化为纯文本。"""
+        tasks = [provider["method"](prompt, provider) for provider in self.providers]
+        results = await asyncio.gather(*tasks)
+        return self._format_plain_text_response(results)
+
+    async def _stream_response_generator(self, prompt: str) -> AsyncGenerator[str, None]:
+        """伪流式生成器，逐字发送内容。"""
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        model_name = settings.VIRTUAL_MODEL
+        
+        try:
+            full_content = await self._get_aggregated_content(prompt)
+            
+            # 逐字发送，模拟打字机效果
+            for char in full_content:
+                chunk = create_chat_completion_chunk(request_id, model_name, char)
+                sse_event = create_sse_data(chunk)
+                logger.info(f"--- [流式发送] ---\n{sse_event.strip()}")
+                yield sse_event
+                await asyncio.sleep(0.01) # 控制打字速度
+
+            # 发送结束标志
+            final_chunk = create_chat_completion_chunk(request_id, model_name, "", "stop")
+            final_event = create_sse_data(final_chunk)
+            logger.info(f"--- [流式结束] ---\n{final_event.strip()}")
+            yield final_event
+            yield DONE_CHUNK
+            
+        except Exception as e:
+            logger.error(f"流式生成器发生错误: {e}", exc_info=True)
+            error_chunk = create_chat_completion_chunk(request_id, model_name, f"\n服务器内部错误: {e}", "stop")
+            yield create_sse_data(error_chunk)
+            yield DONE_CHUNK
+
+    def _build_non_stream_response(self, content: str) -> Dict[str, Any]:
+        """构建完整的非流式JSON响应。"""
+        return {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": settings.VIRTUAL_MODEL,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }
+
+    def _format_plain_text_response(self, results: List[Dict]) -> str:
+        response_parts = []
+        for result in results:
+            provider_name = result.get("provider", "未知")
+            model_name = result.get("model", "N/A")
+            header = f"--- [{provider_name} ({model_name})] ---\n"
+            
+            if result.get("error"):
+                content = f"请求失败: {result['content']}\n"
+            else:
+                content = result.get("content", "无响应内容。\n")
+            
+            response_parts.append(header + content)
+        
+        return "\n".join(response_parts)
+
+    # _call_* 方法保持不变
+    async def _call_cohere(self, prompt: str, provider_info: Dict) -> Dict:
+        payload = {"model": provider_info["model"], "message": prompt, "temperature": 0.5, "max_tokens": 200}
+        headers = {"Authorization": f"Bearer {provider_info['token']}", "Content-Type": "application/json"}
+        try:
+            response = await self.client.post(provider_info["url"], headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return {"provider": provider_info["name"], "model": provider_info["model"], "content": data.get("text", "")}
+        except Exception as e:
+            logger.error(f"请求 {provider_info['name']} 失败: {e}")
+            return {"provider": provider_info["name"], "model": provider_info["model"], "content": str(e), "error": True}
+
+    async def _call_ai21(self, prompt: str, provider_info: Dict) -> Dict:
+        payload = {"model": provider_info["model"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.5, "max_tokens": 200}
+        headers = {"Authorization": f"Bearer {provider_info['token']}", "Content-Type": "application/json"}
+        try:
+            response = await self.client.post(provider_info["url"], headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return {"provider": provider_info["name"], "model": provider_info["model"], "content": data["choices"][0]["message"]["content"]}
+        except Exception as e:
+            logger.error(f"请求 {provider_info['name']} 失败: {e}")
+            return {"provider": provider_info["name"], "model": provider_info["model"], "content": str(e), "error": True}
+
+    async def _call_mistral(self, prompt: str, provider_info: Dict) -> Dict:
+        payload = {"model": provider_info["model"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.5, "max_tokens": 200}
+        headers = {"Authorization": f"Bearer {provider_info['token']}", "Content-Type": "application/json"}
+        try:
+            response = await self.client.post(provider_info["url"], headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return {"provider": provider_info["name"], "model": provider_info["model"], "content": data["choices"][0]["message"]["content"]}
+        except Exception as e:
+            logger.error(f"请求 {provider_info['name']} 失败: {e}")
+            return {"provider": provider_info["name"], "model": provider_info["model"], "content": str(e), "error": True}
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [{"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"} for name in settings.KNOWN_MODELS]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = "data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> str:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+
